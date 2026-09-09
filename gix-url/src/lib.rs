@@ -26,7 +26,7 @@
 
 use std::{borrow::Cow, path::PathBuf};
 
-use bstr::{BStr, BString};
+use bstr::{BStr, BString, ByteSlice};
 use gix_utils::AsBStr;
 
 const HTTP_PATH_ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
@@ -195,6 +195,7 @@ pub struct Url {
     ///
     /// This type has no separate query or fragment fields. For HTTP and HTTPS, `?`, `#`, and everything after them are
     /// stored in this field. For other URL schemes, Git treats `?` and `#` before the first slash as authority text.
+    /// Use [`Self::path_without_query_and_fragment()`] to access the decoded path without these HTTP components.
     ///
     /// For locations in the `<helper>::<address>` form of
     /// [`gitremote-helpers`](https://git-scm.com/docs/gitremote-helpers), this holds the address verbatim,
@@ -468,9 +469,69 @@ impl Url {
             .then_some(encoded.as_ref())
     }
 
-    /// Return the original percent-escaped path if [Self::path] wasn't changed in the meantime, or [`Self::path`] otherwise.
+    /// Return the original percent-escaped spelling of [`Self::path`] when it still matches the current path.
+    ///
+    /// Parsing decodes percent escapes into [`Self::path`], so `/my%20repo` becomes `/my repo`. This method
+    /// preserves the encoded spelling as long as decoding it produces the current path bytes. This compares
+    /// values, not mutation history: restoring the decoded path also restores access to its original spelling.
+    ///
+    /// If no encoded spelling was retained, or the current path differs, return [`Self::path`] as-is. This method
+    /// does not percent-encode a modified path; use [`Self::to_bstring()`] to serialize the complete URL.
+    /// Query and fragment components stored in the path are included; use
+    /// [`Self::path_without_query_and_fragment()`] to obtain the decoded HTTP path without them.
+    ///
+    /// ```
+    /// let mut url = gix_url::parse("https://host/my%20repo")?;
+    /// assert_eq!(url.path, "/my repo", "the public path contains decoded bytes");
+    /// assert_eq!(url.original_path(), "/my%20repo", "the original spelling is retained");
+    ///
+    /// url.path = "/other repo".into();
+    /// assert_eq!(url.original_path(), "/other repo", "a changed path is returned as-is");
+    /// assert_eq!(url.to_bstring(), "https://host/other%20repo", "HTTP serialization encodes spaces");
+    ///
+    /// url.path = "/my repo".into();
+    /// assert_eq!(url.original_path(), "/my%20repo", "restoring the path reuses the original spelling");
+    /// # Ok::<(), gix_url::parse::Error>(())
+    /// ```
     pub fn original_path(&self) -> &BStr {
         self.path_with_percent_escapes().unwrap_or(self.path.as_ref())
+    }
+
+    /// Return the decoded path without query or fragment components for HTTP and HTTPS.
+    ///
+    /// For unchanged parsed HTTP paths, only literal `?` and `#` delimiters in the original spelling end the path.
+    /// Percent escapes are decoded exactly once: `%23` becomes `#`, while `%2523` remains `%23`.
+    /// Paths supplied through [`Self::from_parts()`] or changed through [`Self::path`] are already decoded data:
+    /// literal `?` and `#` delimit components as during serialization, and percent escapes remain literal text.
+    /// Empty HTTP paths return `/`, including when the URL only specifies a query or fragment after the host.
+    ///
+    /// Other schemes return [`Self::path`] unchanged. In particular, SSH paths retain literal `?` and `#`,
+    /// URL-form SSH paths are already decoded, and SCP-style paths retain literal percent escapes.
+    /// Repository names and any `.git` suffix are preserved for the caller to interpret.
+    ///
+    /// ```
+    /// let url = gix_url::parse("https://host/repo%23one?query=value#fragment")?;
+    /// assert_eq!(url.path_without_query_and_fragment(), "/repo#one");
+    /// assert_eq!(url.path, "/repo#one?query=value#fragment");
+    /// # Ok::<(), gix_url::parse::Error>(())
+    /// ```
+    pub fn path_without_query_and_fragment(&self) -> &BStr {
+        if !matches!(self.scheme, Scheme::Http | Scheme::Https) {
+            return self.path.as_ref();
+        }
+        let path_end = match self.path_with_percent_escapes() {
+            Some(encoded) => {
+                let end = encoded.find_byteset(b"?#").unwrap_or(encoded.len());
+                // Map the encoded boundary to a byte offset in the already-decoded public path.
+                percent_encoding::percent_decode(&encoded[..end]).count()
+            }
+            None => self.path.find_byteset(b"?#").unwrap_or(self.path.len()),
+        };
+        if path_end == 0 {
+            "/".into()
+        } else {
+            (&self.path[..path_end]).into()
+        }
     }
 
     /// Return a slash-prefixed path if the bytes after the slash can't be mistaken for a command-line argument.
